@@ -44,11 +44,13 @@ func main() {
 	versionFlag := flag.Bool("version", false, "Show version")
 	shortVersion := flag.Bool("v", false, "Show version (short)")
 	getMonitoring := flag.Bool("get-monitoring-token", false, "Get cached monitoring token")
+	getMCPAuthHeader := flag.Bool("get-mcp-auth-header", false, "Print {\"Authorization\":\"Bearer <id_token>\"} from the cached token for an MCP headersHelper (never opens a browser)")
 	clearCache := flag.Bool("clear-cache", false, "Clear cached credentials")
 	checkExpiration := flag.Bool("check-expiration", false, "Check if credentials are expired")
 	refreshIfNeeded := flag.Bool("refresh-if-needed", false, "Refresh credentials if expired")
 	showTags := flag.Bool("show-tags", false, "Print the https://aws.amazon.com/tags claim from the cached ID token (debug)")
 	getTag := flag.String("get-tag", "", "Print the value of a single principal tag from the cached ID token (e.g. --get-tag Zone). Exit codes: 0 hit, 2 absent, 4 expired.")
+	login := flag.Bool("login", false, "Interactively sign in (IDC: run device authorization and cache the SSO token), then exit. Use this once on headless/SSH hosts before Claude Code runs.")
 	flag.Parse()
 
 	if *versionFlag || *shortVersion {
@@ -96,17 +98,36 @@ func main() {
 	if *getMonitoring {
 		os.Exit(app.getMonitoringToken())
 	}
+	if *getMCPAuthHeader {
+		os.Exit(app.getMCPAuthHeader())
+	}
 	if *checkExpiration {
 		os.Exit(app.checkExpiration())
+	}
+	if *login {
+		// Interactive sign-in only (no credential JSON on stdout). For IDC this
+		// runs device authorization and caches the SSO token so subsequent
+		// non-interactive runs (e.g. Claude Code) reuse it silently — the
+		// recommended first step on headless/SSH hosts.
+		if cfg.IsIDC() {
+			os.Exit(app.runIDCLogin())
+		}
+		fmt.Fprintln(os.Stderr, "--login is only supported for IAM Identity Center (auth_type=idc) profiles.")
+		if cfg.IsSsoEnabled() {
+			fmt.Fprintln(os.Stderr, "OIDC profiles authenticate automatically via the browser on first use; no separate login step is needed.")
+		} else {
+			fmt.Fprintln(os.Stderr, "This profile uses the ambient AWS credential chain; no sign-in step is needed.")
+		}
+		os.Exit(1)
 	}
 
 	// Auth dispatch: IDC > legacy passthrough > OIDC
 	if cfg.IsIDC() {
-		os.Exit(app.runIDC())
+		exitAfterNotifications(app.runIDC())
 	}
 	if !cfg.IsSsoEnabled() {
 		// Legacy passthrough: no IDC fields, just ambient credential chain.
-		os.Exit(app.runPassthrough())
+		exitAfterNotifications(app.runPassthrough())
 	}
 
 	// OIDC path — resolve provider type and redirect port
@@ -138,7 +159,18 @@ func main() {
 		// Fall through to normal auth flow
 	}
 
-	os.Exit(app.run())
+	exitAfterNotifications(app.run())
+}
+
+// exitAfterNotifications waits for any pending quota browser notification to be
+// fetched (or time out) before terminating. Credentials are already written to
+// stdout by the time run()/runIDC()/runPassthrough() return, so this only holds
+// the process open long enough for the browser to connect — it never delays the
+// AWS SDK. Without it, os.Exit kills the notification server goroutine before
+// the browser connects (ERR_CONNECTION_REFUSED).
+func exitAfterNotifications(code int) {
+	waitForQuotaNotification()
+	os.Exit(code)
 }
 
 type credentialApp struct {
@@ -261,6 +293,45 @@ func (a *credentialApp) getMonitoringToken() int {
 	a.saveMonitoringTokenAndHeaders(authResult.IDToken, map[string]interface{}(authResult.TokenClaims))
 
 	fmt.Println(authResult.IDToken)
+	return 0
+}
+
+// getMCPAuthHeader prints {"Authorization":"Bearer <id_token>"} to stdout for
+// use as an MCP server headersHelper (the AgentCore web-search gateway uses a
+// CUSTOM_JWT authorizer that validates the same OIDC id_token the solution
+// already mints). It MUST NOT open a browser and MUST return quickly so it fits
+// inside Claude Code's headersHelper budget — so unlike getMonitoringToken it
+// never falls through to authenticate(). On a cache miss it attempts only the
+// browserless refresh_token exchange; if that also fails it exits non-zero with
+// a clear stderr message rather than hanging or prompting.
+func (a *credentialApp) getMCPAuthHeader() int {
+	token, err := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
+	if (err != nil || token == "") && a.cfg.IsSsoEnabled() && !a.cfg.IsIDC() {
+		// Cached id_token expired/near-expiry. Try the silent refresh_token
+		// exchange (no browser) before giving up — but stop here: an MCP
+		// headersHelper can never drive an interactive login. Only attempt for
+		// OIDC; idc/none have no id_token.
+		//
+		// Use refreshIDTokenOnly (NOT tryRefreshToken): the gateway's CUSTOM_JWT
+		// authorizer only needs the id_token, so a successful refresh must NOT be
+		// thrown away just because the unrelated AWS STS/IAM credential exchange
+		// fails or times out. tryRefreshToken couples the two and would discard a
+		// perfectly valid refreshed id_token on a Cognito/STS hiccup.
+		if fresh := a.refreshIDTokenOnly(); fresh != "" {
+			token, err = fresh, nil
+		}
+	}
+	if err != nil || token == "" {
+		fmt.Fprintf(os.Stderr, "Error: no valid cached token for profile '%s'; run the credential process once to authenticate.\n", a.profile)
+		return 1
+	}
+
+	out, mErr := json.Marshal(map[string]string{"Authorization": "Bearer " + token})
+	if mErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to encode auth header: %v\n", mErr)
+		return 1
+	}
+	fmt.Println(string(out))
 	return 0
 }
 
@@ -430,6 +501,7 @@ func (a *credentialApp) run() int {
 					printQuotaBlocked(qr)
 					return 1
 				}
+				printQuotaWarning(qr)
 				_ = storage.SaveQuotaState(a.profile)
 			}
 		}
@@ -449,6 +521,7 @@ func (a *credentialApp) run() int {
 					printQuotaBlocked(qr)
 					return 1
 				}
+				printQuotaWarning(qr)
 				_ = storage.SaveQuotaState(a.profile)
 			}
 		}
@@ -471,6 +544,7 @@ func (a *credentialApp) run() int {
 			printQuotaBlocked(qr)
 			return 1
 		}
+		printQuotaWarning(qr)
 		_ = storage.SaveQuotaState(a.profile)
 	}
 
@@ -638,18 +712,15 @@ func (a *credentialApp) tryRefreshToken() *federation.AWSCredentials {
 
 	debugPrint("Found cached refresh_token, attempting token exchange...")
 
-	// Resolve token endpoint URL
+	// Resolve token endpoint URL. Generic providers supply an absolute URL
+	// directly; named providers go through the shared builder that normalizes
+	// the domain (e.g. strips Azure's trailing /v2.0) so this refresh path and
+	// the authorization-code flow always produce the same URL.
 	var tokenURL string
 	if a.providerType == "generic" {
 		tokenURL = a.cfg.OIDCTokenEndpoint
 	} else {
-		provCfg := provider.ConfigFor(a.providerType, a.cfg.OktaAuthServerID)
-		if strings.HasPrefix(provCfg.TokenEndpoint, "https://") {
-			tokenURL = provCfg.TokenEndpoint
-		} else {
-			domain := a.cfg.ProviderDomain
-			tokenURL = "https://" + domain + provCfg.TokenEndpoint
-		}
+		tokenURL = provider.TokenEndpointURL(a.providerType, a.cfg.OktaAuthServerID, a.cfg.ProviderDomain)
 	}
 
 	// Resolve confidential client auth (Azure secret/cert)
@@ -709,6 +780,70 @@ func (a *credentialApp) tryRefreshToken() *federation.AWSCredentials {
 	return creds
 }
 
+// refreshIDTokenOnly performs the browserless refresh_token exchange and returns
+// a fresh id_token WITHOUT exchanging it for AWS credentials. It exists for the
+// MCP headersHelper path (--get-mcp-auth-header): the AgentCore CUSTOM_JWT gateway
+// authorizer validates only the id_token, so the header must still be emitted even
+// when the AWS STS/IAM credential exchange would fail or time out — a failure mode
+// unrelated to gateway auth. (tryRefreshToken couples the two and returns nil if
+// cred exchange fails, which would discard a valid refreshed id_token.)
+//
+// It mirrors tryRefreshToken's endpoint/confidential-auth resolution and persists
+// the refreshed monitoring token + rotated refresh_token so the next cache read
+// hits, but never opens a browser. Returns "" on any failure so the caller fails
+// cleanly. Only meaningful for OIDC (idc/none have no id_token).
+func (a *credentialApp) refreshIDTokenOnly() string {
+	refreshToken := storage.LoadRefreshToken(a.profile, a.cfg.CredentialStorage)
+	if refreshToken == "" {
+		debugPrint("No cached refresh_token, cannot refresh id_token silently")
+		return ""
+	}
+
+	// Resolve token endpoint URL — use shared builder from #666 to avoid
+	// Azure /v2.0 doubling and keep parity with tryRefreshToken.
+	var tokenURL string
+	if a.providerType == "generic" {
+		tokenURL = a.cfg.OIDCTokenEndpoint
+	} else {
+		tokenURL = provider.TokenEndpointURL(a.providerType, a.cfg.OktaAuthServerID, a.cfg.ProviderDomain)
+	}
+
+	confidential, err := a.resolveConfidentialAuth()
+	if err != nil {
+		debugPrint("Failed to resolve confidential auth for id_token refresh: %v", err)
+		return ""
+	}
+
+	tokenResp, err := oidc.RefreshTokenExchange(tokenURL, refreshToken, a.cfg.ClientID, confidential)
+	if err != nil {
+		debugPrint("Refresh token exchange failed: %v", err)
+		// Token may be revoked/expired — clear it so we don't retry next time.
+		storage.ClearRefreshToken(a.profile)
+		return ""
+	}
+	if tokenResp.IDToken == "" {
+		debugPrint("Refresh response did not contain an id_token")
+		return ""
+	}
+
+	claims, err := jwt.DecodePayload(tokenResp.IDToken)
+	if err != nil {
+		debugPrint("Failed to decode refreshed id_token: %v", err)
+		return ""
+	}
+
+	// Persist the refreshed monitoring token so the next cache read hits, and
+	// rotate the refresh_token (some IdPs rotate on every use). Deliberately no
+	// AWS credential exchange here — see the doc comment above.
+	a.saveMonitoringTokenAndHeaders(tokenResp.IDToken, map[string]interface{}(claims))
+	if tokenResp.RefreshToken != "" {
+		_ = storage.SaveRefreshToken(a.profile, a.cfg.CredentialStorage, tokenResp.RefreshToken)
+	}
+
+	debugPrint("id_token refreshed without browser (no AWS credential exchange)")
+	return tokenResp.IDToken
+}
+
 // saveMonitoringTokenAndHeaders persists the monitoring token and also writes
 // the otel-headers cache so the PowerShell fallback (otel-helper.ps1) can serve
 // attribution headers without needing the Go otel-helper binary.
@@ -736,7 +871,6 @@ func (a *credentialApp) saveMonitoringTokenAndHeaders(idToken string, claims map
 	}
 }
 
-
 func (a *credentialApp) shouldRecheckQuota() bool {
 	if a.cfg.QuotaAPIEndpoint == "" {
 		return false
@@ -754,7 +888,24 @@ func (a *credentialApp) shouldRecheckQuota() bool {
 func (a *credentialApp) performQuotaRecheck() bool {
 	token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
 	if token == "" {
-		return true // no token to check with — allow (fail-open for missing token)
+		// Cached id_token aged past the 10-min buffer in GetMonitoringToken.
+		// This path is OIDC-only (IDC/passthrough have separate entrypoints),
+		// so the quota API expects a JWT — a SigV4 call would 401. Mirror the
+		// getMonitoringToken() handler: try a silent refresh_token exchange to
+		// mint a fresh id_token before giving up, so an over-quota user is still
+		// warned/blocked on the cache-hit fast path instead of silently passing.
+		if creds := a.tryRefreshToken(); creds != nil {
+			token, _ = storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
+		}
+	}
+	if token == "" {
+		// No cached token and no usable refresh_token (revoked/absent). The only
+		// remaining recovery is a browser flow, which must NOT fire on the
+		// cache-hit fast path (runs on every AWS API call). Fail open, but leave
+		// the quota-state timestamp unset so the next invocation retries once a
+		// fresh token is available.
+		debugPrint("Quota recheck skipped: no cached id_token and no usable refresh_token")
+		return true
 	}
 	qr := quota.Check(a.cfg.QuotaAPIEndpoint, token, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
 
@@ -884,6 +1035,9 @@ func printQuotaWarning(qr *quota.Result) {
 	}
 
 	fmt.Fprintln(os.Stderr, "============================================================")
+
+	// Show browser notification for visual feedback (invisible stderr → visible browser)
+	showQuotaBrowserNotification(qr, false)
 }
 
 func formatTokens(n float64) string {
@@ -950,6 +1104,9 @@ func printQuotaBlocked(qr *quota.Result) {
 
 	fmt.Fprintln(os.Stderr, "\nTo request an unblock, contact your administrator.")
 	fmt.Fprintln(os.Stderr, "============================================================")
+
+	// Show browser notification for blocked state
+	showQuotaBrowserNotification(qr, true)
 }
 
 func outputJSON(v interface{}) {

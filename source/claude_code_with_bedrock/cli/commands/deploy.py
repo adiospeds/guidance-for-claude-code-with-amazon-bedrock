@@ -392,7 +392,7 @@ class DeployCommand(Command):
                         stack_name=stack_name,
                         template_path=template_path,
                         parameters=boto3_params,
-                        capabilities=capabilities or ["CAPABILITY_IAM"],
+                        capabilities=capabilities or ["CAPABILITY_NAMED_IAM"],
                         on_event=lambda e: progress.update(
                             task,
                             description=f"{e.get('LogicalResourceId', 'Stack')} - {e.get('ResourceStatus', '')}"
@@ -435,7 +435,33 @@ class DeployCommand(Command):
 
             # Deploy based on stack type
             if stack_type == "auth":
-                # Select template based on provider type
+                # IAM Identity Center uses a dedicated template
+                if profile.effective_auth_type == "idc":
+                    template = project_root / "deployment" / "infrastructure" / "bedrock-auth-idc.yaml"
+                    stack_name = profile.stack_names.get("auth", f"{profile.identity_pool_name}-stack")
+
+                    from claude_code_with_bedrock.models import get_all_bedrock_regions
+
+                    bedrock_regions = profile.allowed_bedrock_regions
+                    if not bedrock_regions:
+                        bedrock_regions = [r for r in get_all_bedrock_regions() if "gov" not in r]
+
+                    idc_role_name = getattr(profile, "idc_permission_set_name", None) or "BedrockIDCFederatedRole"
+                    params = [
+                        f"FederatedRoleName={idc_role_name}",
+                        f"IdentityPoolName={profile.identity_pool_name}",
+                        f"AllowedBedrockRegions={','.join(bedrock_regions)}",
+                        f"EnableMonitoring={str(profile.monitoring_enabled).lower()}",
+                    ]
+                    return deploy_with_cf(
+                        template,
+                        stack_name,
+                        params,
+                        ["CAPABILITY_NAMED_IAM"],
+                        task_description="Deploying IAM Identity Center auth stack...",
+                    )
+
+                # Select template based on provider type (OIDC)
                 provider_type = profile.provider_type or "okta"
                 template_map = {
                     "okta": "bedrock-auth-okta.yaml",
@@ -787,6 +813,11 @@ class DeployCommand(Command):
                 analytics_enabled = "true" if getattr(profile, "analytics_enabled", True) else "false"
                 params.append(f"EnableAnalytics={analytics_enabled}")
 
+                # Pass ALB scheme (internet-facing or internal) for private network deployments
+                alb_scheme = monitoring_config.get("alb_scheme", "internet-facing")
+                if alb_scheme == "internal":
+                    params.append("ALBScheme=internal")
+
                 console.print(f"[dim]Using parameters: {params}[/dim]")
                 result = deploy_with_cf(
                     template, stack_name, params, task_description="Deploying monitoring collector..."
@@ -1035,7 +1066,7 @@ class DeployCommand(Command):
         region = get_codebuild_region(profile) if stack_type == "codebuild" else profile.aws_region
 
         def print_deploy_cmd(template, stack_name, params, capabilities=None):
-            caps_str = " ".join(capabilities or ["CAPABILITY_IAM"])
+            caps_str = " ".join(capabilities or ["CAPABILITY_NAMED_IAM"])
             lines = [
                 "aws cloudformation deploy \\",
                 f"    --template-file {template} \\",

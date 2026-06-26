@@ -123,19 +123,81 @@ For automated deployment at scale, create an MDM profile with the following esse
 | `inferenceBedrockProfile` | Name of the AWS named profile in `~/.aws/config` that Claude Desktop should use for Bedrock calls. The installer configures this profile with `credential_process` pointing at the bundled `credential-process` binary |
 | `inferenceBedrockRegion` | AWS region for Bedrock API calls (e.g., `us-west-2`, `us-east-1`) |
 | `inferenceBedrockAwsDir` | Path to the directory containing AWS config/credentials files (default: `~/.aws`) |
-| `inferenceModels` | JSON array of model aliases available to users (`opus`, `sonnet`, `haiku`). First entry is the default |
+| `inferenceModels` | JSON array of model entries. Supports simple aliases (`["opus", "sonnet", "haiku"]`) or object entries with tier tagging (see below). First entry is the default |
 
 > **Note:** The model aliases used by CoWork 3P (`opus`, `sonnet`, `haiku`) are resolved internally by Claude Desktop and may differ from the CRIS model IDs configured for Claude Code via `ANTHROPIC_MODEL`. The `ccwb cowork generate` command includes all available aliases by default. Use `--models` to customize the list for your organization.
 
+#### Model Entries with Family Tier (v1.13576+)
+
+Claude Desktop supports object entries in `inferenceModels` with `anthropicFamilyTier` and `isFamilyDefault` fields. This lets tier shortcuts (like "opus" and "sonnet" in the model picker) resolve to your specific Bedrock model IDs:
+
+```json
+"inferenceModels": [
+  {
+    "name": "global.anthropic.claude-opus-4-8",
+    "labelOverride": "Claude Opus 4.8",
+    "anthropicFamilyTier": "opus",
+    "isFamilyDefault": true
+  },
+  {
+    "name": "global.anthropic.claude-sonnet-4-6",
+    "labelOverride": "Claude Sonnet 4.6",
+    "anthropicFamilyTier": "sonnet",
+    "isFamilyDefault": true
+  },
+  {
+    "name": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "labelOverride": "Claude Haiku 4.5",
+    "anthropicFamilyTier": "haiku",
+    "isFamilyDefault": true
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | The model ID your provider routes (e.g., CRIS inference profile ID) |
+| `labelOverride` | string | Optional display name in the model picker |
+| `anthropicFamilyTier` | string | Which Claude tier this model stands in for: `opus`, `sonnet`, `haiku`, or `fable` |
+| `isFamilyDefault` | boolean | Whether this is the default model when the tier shortcut is used |
+| `supports1m` | boolean | Whether the model supports 1M token context |
+
+> **When to use object format:** Use it when your Bedrock setup uses specific CRIS inference profile IDs (e.g., `global.anthropic.claude-opus-4-8`) and you want the tier shortcuts in the Claude Desktop model picker to resolve to those exact model IDs. The simple alias format (`["opus", "sonnet", "haiku"]`) still works and lets Claude Desktop handle resolution internally.
+
 ### How Credentials Flow
 
+This solution supports two credential modes for CoWork. The **credential helper** mode (default since v2.6.0) is recommended because it gives Claude Desktop direct control over credential lifecycle, eliminating the stale-credential bug that required manual app restarts.
+
+#### Credential Helper Mode (Recommended)
+
 When Claude Cowork starts a session:
+
+1. Claude Desktop reads `inferenceCredentialHelper` from the MDM policy — this points directly at the credential-process binary
+2. Claude Desktop runs the binary and reads temporary AWS credentials from stdout
+3. The output is cached for `inferenceCredentialHelperTtlSec` seconds (default: 3500, just under the 1h STS token lifetime)
+4. When the cache expires, Claude Desktop automatically re-runs the helper — **no restart required**
+5. If credentials are rejected mid-session, Claude Desktop re-runs with `CLAUDE_HELPER_CONTEXT=mid-session-refresh` for seamless recovery (20s timeout)
+
+The credential-process binary handles the `CLAUDE_HELPER_CONTEXT` environment variable:
+- `interactive` → Full browser-based OIDC authentication
+- `mid-session-refresh` → Silent refresh via cached refresh_token (no browser)
+- `background` / `setup-test` → Silent path only, exit non-zero if unavailable
+
+This mode resolves the known issue where CoWork doesn't automatically refresh AWS credentials after token expiry (affecting both IDC and OIDC/Azure AD federated auth users).
+
+Ref: [Claude Desktop Credential Helper documentation](https://claude.com/docs/third-party/claude-desktop/credential-helper)
+
+#### AWS Profile Mode (Legacy)
+
+The legacy flow uses `inferenceBedrockProfile` instead:
 
 1. Claude Desktop reads `inferenceBedrockProfile` from the applied MDM policy (registry on Windows, managed preference on macOS)
 2. It hands that profile name to the AWS SDK, which resolves the corresponding `[profile <name>]` stanza in `~/.aws/config`
 3. The stanza's `credential_process = .../credential-process --profile <name>` entry runs the bundled credential-process binary
 4. The binary authenticates the user via your OIDC provider (Okta, Azure AD, Auth0, etc.) and returns temporary AWS credentials in the standard AWS `credential_process` JSON format
 5. The AWS SDK signs each Bedrock call with those credentials; caching and refresh are handled automatically by the SDK
+
+To use this mode, set `cowork_credential_mode = "profile"` in your deployment profile before running `ccwb cowork generate`.
 
 No wrapper script is required — CoWork reuses the same `credential-process` binary and `~/.aws/config` entry that `install.sh` / `install.bat` already configure for Claude Code CLI.
 

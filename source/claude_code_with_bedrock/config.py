@@ -34,6 +34,9 @@ class Profile:
     cross_region_profile: str | None = None  # Cross-region profile: "us", "europe", "apac"
     selected_model: str | None = None  # Selected Claude model ID (e.g., "us.anthropic.claude-3-7-sonnet-20250805-v1:0")
     model_alias: str | None = None  # Claude Code alias for ANTHROPIC_MODEL: "sonnet", "opus", "opusplan", "haiku"
+    lock_default_model: bool = (
+        False  # Write ANTHROPIC_MODEL + DEFAULT_*_MODEL into managed-settings (locks users to admin's choice)
+    )
     selected_source_region: str | None = None  # User-selected source region for AWS config and Claude Code settings
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -114,6 +117,7 @@ class Profile:
     idc_start_url: str | None = None  # e.g. https://company.awsapps.com/start
     idc_account_id: str | None = None  # AWS account ID for IDC access
     idc_permission_set_name: str | None = None  # Permission set / role name
+    sso_region: str | None = None  # AWS region where Identity Center is configured
 
     # Confidential client authentication (Azure AD / Entra ID)
     # If neither is set, public client flow is used (current default).
@@ -148,6 +152,17 @@ class Profile:
     cowork_3p_enabled: bool = True  # Generate CoWork 3P MDM configs during packaging
     cowork_3p_extra_keys: dict[str, str] = field(default_factory=dict)  # Custom MDM keys merged into CoWork 3P output
     cowork_service_token: str = ""  # Static token for CoWork ALB auth bypass (set during init)
+    cowork_credential_mode: str = (
+        "helper"  # "helper" (inferenceCredentialHelper) or "profile" (inferenceBedrockProfile)
+    )
+    cowork_credential_helper_ttl_sec: int = 3500  # inferenceCredentialHelperTtlSec (refresh before 1h STS expiry)
+
+    # Cowork beta features (managed configuration keys)
+    cowork_chat_tab_enabled: bool = True  # chatTabEnabled — enables the Chat tab
+    cowork_chat_advanced_file_analysis: bool = (
+        True  # chatAdvancedFileAnalysisEnabled — code execution for file analysis
+    )
+    cowork_inference_session_lifetime_sec: int | None = None  # inferenceSessionLifetimeSec — re-auth reminder timer
 
     # Legacy field support
     @property

@@ -379,6 +379,70 @@ class InitCommand(Command):
             config["auth_type"] = auth_method
             config["sso_enabled"] = auth_method == "oidc"
 
+        # IAM Identity Center Configuration
+        if not skip_okta and config.get("auth_type") == "idc":
+            console.print("\n[bold blue]IAM Identity Center Configuration[/bold blue]")
+            console.print("─" * 30)
+            console.print()
+            console.print("Configure your IAM Identity Center (SSO) connection.")
+            console.print("Users will authenticate via their SSO portal and receive")
+            console.print("temporary credentials for Bedrock access.\n")
+
+            # IDC start URL
+            idc_start_url = questionary.text(
+                "Enter your IAM Identity Center start URL:",
+                instruction="(e.g., https://company.awsapps.com/start)",
+                default=config.get("idc_start_url", ""),
+                validate=lambda x: bool(x.strip()) or "Start URL cannot be empty",
+            ).ask()
+            if idc_start_url is None:
+                return None
+            config["idc_start_url"] = idc_start_url.strip().rstrip("/")
+
+            # SSO region (auto-suggest from start URL if possible)
+            suggested_region = "us-east-1"
+            _region_match = re.search(r"\.(us|eu|ap|sa|ca|me|af|il)-[a-z]+-\d+\.", idc_start_url)
+            if _region_match:
+                suggested_region = _region_match.group(0).strip(".")
+
+            sso_region = questionary.text(
+                "Enter your SSO region (where Identity Center is configured):",
+                default=config.get("sso_region", suggested_region),
+                validate=lambda x: bool(x.strip()) or "SSO region cannot be empty",
+            ).ask()
+            if sso_region is None:
+                return None
+            config["sso_region"] = sso_region.strip()
+
+            # AWS account ID
+            account_id = questionary.text(
+                "Enter the AWS account ID for Bedrock access:",
+                default=config.get("idc_account_id", ""),
+                validate=lambda x: (
+                    (len(x.strip()) == 12 and x.strip().isdigit()) or "Must be a 12-digit AWS account ID"
+                ),
+            ).ask()
+            if account_id is None:
+                return None
+            config["idc_account_id"] = account_id.strip()
+
+            # Permission set name
+            permission_set = questionary.text(
+                "Enter the permission set name (IAM role users will assume):",
+                instruction="(e.g., BedrockDeveloperAccess)",
+                default=config.get("idc_permission_set_name", "BedrockDeveloperAccess"),
+                validate=lambda x: bool(x.strip()) or "Permission set name cannot be empty",
+            ).ask()
+            if permission_set is None:
+                return None
+            config["idc_permission_set_name"] = permission_set.strip()
+
+            console.print("\n[green]✓[/green] IAM Identity Center configured")
+            console.print(f"  Start URL: {config['idc_start_url']}")
+            console.print(f"  Region: {config['sso_region']}")
+            console.print(f"  Account: {config['idc_account_id']}")
+            console.print(f"  Permission Set: {config['idc_permission_set_name']}")
+
         # OIDC Provider Configuration
         if not skip_okta and config.get("sso_enabled", True):
             console.print("\n[bold blue]OIDC Provider Configuration[/bold blue]")
@@ -702,7 +766,7 @@ class InitCommand(Command):
                 config["client_certificate_key_path"] = client_certificate_key_path
 
             # Credential Storage Method
-            from claude_code_with_bedrock.cli.utils.helpers import is_wsl, is_keyring_available
+            from claude_code_with_bedrock.cli.utils.helpers import is_keyring_available, is_wsl
 
             wsl_detected = is_wsl()
             keyring_available = is_keyring_available()
@@ -952,6 +1016,24 @@ class InitCommand(Command):
                     if not vpc_config:
                         return None
                     config["monitoring"]["vpc_config"] = vpc_config
+
+                    # ALB scheme: internet-facing (default) or internal (private network)
+                    existing_alb_scheme = config["monitoring"].get("alb_scheme", "internet-facing")
+                    alb_scheme = questionary.select(
+                        "Load balancer network exposure:",
+                        choices=[
+                            questionary.Choice(
+                                "Internet-facing (default — accessible from public internet)",
+                                value="internet-facing",
+                            ),
+                            questionary.Choice(
+                                "Internal (private — only accessible via VPN/Direct Connect/internal network)",
+                                value="internal",
+                            ),
+                        ],
+                        default=existing_alb_scheme,
+                    ).ask()
+                    config["monitoring"]["alb_scheme"] = alb_scheme
 
                     # Optional: Configure HTTPS with custom domain
                     console.print("\n[yellow]Optional: Configure HTTPS for secure telemetry[/yellow]")
@@ -1452,6 +1534,19 @@ class InitCommand(Command):
         if config["settings_target"] == "managed":
             console.print("[green]✓[/green] Settings will be deployed to OS-level managed path")
             console.print("[dim]  Users will need sudo (Unix) or Administrator (Windows) to install[/dim]")
+
+            # Ask whether to lock model selection in managed settings
+            console.print()
+            saved_lock = config.get("lock_default_model", False)
+            lock_model = questionary.confirm(
+                "Lock default model for all users? (Prevents users from changing model via /model)",
+                default=saved_lock,
+            ).ask()
+            config["lock_default_model"] = lock_model if lock_model is not None else False
+            if not config["lock_default_model"]:
+                console.print("[green]✓[/green] Users can freely select models via /model (CRIS routing still applied)")
+            else:
+                console.print("[yellow]![/yellow] Default model will be enforced for all users via managed-settings")
         else:
             console.print("[green]✓[/green] Settings will be deployed to user-scope path")
 
@@ -2459,6 +2554,11 @@ class InitCommand(Command):
             "federation_type": config_data.get("federation_type", "cognito"),
             "max_session_duration": config_data.get("max_session_duration", 28800),
             "sso_enabled": config_data.get("sso_enabled", True),
+            "auth_type": config_data.get("auth_type", "oidc"),
+            "idc_start_url": config_data.get("idc_start_url"),
+            "idc_account_id": config_data.get("idc_account_id"),
+            "idc_permission_set_name": config_data.get("idc_permission_set_name"),
+            "sso_region": config_data.get("sso_region"),
             "azure_auth_mode": config_data.get("azure_auth_mode"),
             "client_certificate_path": config_data.get("client_certificate_path"),
             "client_certificate_key_path": config_data.get("client_certificate_key_path"),
@@ -2496,9 +2596,14 @@ class InitCommand(Command):
             "cowork_3p_enabled": config_data.get("cowork_3p", {}).get("enabled", True),
             "cowork_3p_extra_keys": config_data.get("cowork_3p", {}).get("extra_keys", {}),
             "cowork_service_token": config_data.get("cowork_3p", {}).get("service_token", ""),
+            "cowork_chat_tab_enabled": config_data.get("cowork_3p", {}).get("chat_tab_enabled", True),
+            "cowork_chat_advanced_file_analysis": config_data.get("cowork_3p", {}).get(
+                "chat_advanced_file_analysis", True
+            ),
             "settings_target": "managed"
             if (self._io and self.option("managed"))
             else config_data.get("settings_target", "user"),
+            "lock_default_model": config_data.get("lock_default_model", False),
             "tags": config_data.get("tags", {}),
             "redirect_port": config_data.get("redirect_port"),
         }
@@ -2832,6 +2937,10 @@ class InitCommand(Command):
             if hasattr(profile, "selected_model") and profile.selected_model:
                 existing_config["aws"]["selected_model"] = profile.selected_model
 
+            # Add lock_default_model if present
+            if hasattr(profile, "lock_default_model"):
+                existing_config["lock_default_model"] = profile.lock_default_model
+
             # Add cross-region profile if present
             if hasattr(profile, "cross_region_profile") and profile.cross_region_profile:
                 existing_config["aws"]["cross_region_profile"] = profile.cross_region_profile
@@ -2859,6 +2968,10 @@ class InitCommand(Command):
                 cowork_3p_config["extra_keys"] = profile.cowork_3p_extra_keys
             if profile.cowork_service_token:
                 cowork_3p_config["service_token"] = profile.cowork_service_token
+            if profile.cowork_chat_tab_enabled:
+                cowork_3p_config["chat_tab_enabled"] = True
+            if profile.cowork_chat_advanced_file_analysis:
+                cowork_3p_config["chat_advanced_file_analysis"] = True
             existing_config["cowork_3p"] = cowork_3p_config
 
             # Add distribution configuration if present

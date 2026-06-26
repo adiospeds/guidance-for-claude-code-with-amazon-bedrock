@@ -62,6 +62,17 @@ Parameters:
       CoWork cannot perform OIDC auth (no browser/helper), so this
       provides an alternative auth path for its OTLP events.
 
+  ALBScheme:
+    Type: String
+    Default: 'internet-facing'
+    AllowedValues:
+      - 'internet-facing'
+      - 'internal'
+    Description: >-
+      Load balancer scheme. Use 'internal' for private network deployments
+      where users connect via VPN, Direct Connect, or internal office networks.
+      Default: internet-facing (backwards compatible).
+
 Conditions:
   HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, '']]
   NoCustomDomain: !Equals [!Ref CustomDomainName, '']
@@ -87,6 +98,7 @@ Conditions:
     - !Condition HasJwtAuth
     - !Condition HasCoWorkToken
   AnalyticsEnabled: !Equals [!Ref EnableAnalytics, 'true']
+  IsInternalALB: !Equals [!Ref ALBScheme, 'internal']
 
 # Rules section removed - validation handled by deployment script
 
@@ -153,13 +165,45 @@ Resources:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS access from anywhere
+          CidrIp: !If [IsInternalALB, '10.0.0.0/8', '0.0.0.0/0']
+          Description: !If [IsInternalALB, 'HTTPS from private networks (10.x.x.x)', 'HTTPS access from anywhere']
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: '172.16.0.0/12'
+            Description: 'HTTPS from private networks (172.16.x.x)'
+          - !Ref AWS::NoValue
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: '192.168.0.0/16'
+            Description: 'HTTPS from private networks (192.168.x.x)'
+          - !Ref AWS::NoValue
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp: 0.0.0.0/0
-          Description: HTTP access (redirects to HTTPS)
+          CidrIp: !If [IsInternalALB, '10.0.0.0/8', '0.0.0.0/0']
+          Description: !If [IsInternalALB, 'HTTP from private networks (10.x.x.x)', 'HTTP access (redirects to HTTPS)']
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: '172.16.0.0/12'
+            Description: 'HTTP from private networks (172.16.x.x)'
+          - !Ref AWS::NoValue
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: '192.168.0.0/16'
+            Description: 'HTTP from private networks (192.168.x.x)'
+          - !Ref AWS::NoValue
       Tags:
         - Key: Name
           Value: otel-collector-alb-sg
@@ -212,7 +256,18 @@ Resources:
     Properties:
       Type: application
       IpAddressType: ipv4
-      Scheme: internet-facing
+      Scheme: !Ref ALBScheme
+      LoadBalancerAttributes:
+        # Raise the idle timeout above the AWS default of 60s. Claude Code
+        # reuses a pooled keep-alive connection for OTLP metric exports, which
+        # only happen after activity (e.g. a model response). At 60s the ALB
+        # reaps the connection during idle gaps between turns, so the next
+        # export reuses a dead socket and logs a benign but noisy "socket hang
+        # up". 300s covers typical in-session pauses. (Reduces, but cannot fully
+        # eliminate — arbitrarily long idle gaps still reap the connection; the
+        # root cause is client-side connection reuse.)
+        - Key: idle_timeout.timeout_seconds
+          Value: '300'
       SecurityGroups:
         - !Ref ALBSecurityGroup
       Subnets: !Ref SubnetIds
@@ -226,9 +281,18 @@ Resources:
   HTTPTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      # Name omitted intentionally — CloudFormation auto-generates a unique name
-      # that respects the 32-char limit. Previously used !Sub '${AWS::StackName}-tg'
-      # which failed when stack names exceeded 29 characters (issue #86).
+      # Name is derived from the ALB's unique hex ID (last segment of its ARN).
+      # When the LoadBalancer is replaced its unique ID changes, so this name
+      # changes too — CloudFormation replaces the target group alongside the LB.
+      # Without this coupling, CF tries to attach the old TG to the new LB while
+      # the old LB still owns it, producing:
+      #   "target group cannot be associated with more than one load balancer"
+      # Using the ALB ID keeps the name within the 32-char limit: "tg-" (3) +
+      # 16-char hex ID = 19 chars max. (issue #86 used !Sub '${AWS::StackName}-tg'
+      # which exceeded the limit for long stack names; this approach avoids that.)
+      Name: !Sub
+        - 'tg-${AlbId}'
+        - AlbId: !Select [3, !Split ['/', !Ref LoadBalancer]]
       Port: 4318
       Protocol: HTTP
       TargetType: ip

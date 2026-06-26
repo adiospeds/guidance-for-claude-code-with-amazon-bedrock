@@ -2985,7 +2985,7 @@ Available metrics include:
                 if endpoint:
                     # Add monitoring configuration
                     resource_attrs = otel_resource_attributes or (
-                        "department=engineering,team.id=default,"
+                        "department=default,team.id=default,"
                         "cost_center=default,organization=default,"
                         "project=default"
                     )

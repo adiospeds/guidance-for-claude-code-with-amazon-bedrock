@@ -17,8 +17,34 @@ Rates can be overridden via BEDROCK_PRICING_RATES_JSON env var.
 import json
 import os
 
+# OTEL `type` attribute values (as emitted by Claude Code and CoWork) mapped to
+# the internal rate-table keys below. Claude Code emits camelCase `cacheRead` /
+# `cacheCreation`; other paths may use snake_case. This map is the ONLY place
+# that bridges metric type names → rate keys — never look a metric `type` up in
+# the rate table directly (the table has no `cacheCreation` key, so a direct
+# lookup silently prices cache-write tokens at $0). See resolve_rate_key().
+TOKEN_TYPE_TO_RATE_KEY = {
+    "input": "input",
+    "output": "output",
+    "cacheRead": "cache_read",
+    "cache_read": "cache_read",
+    "cacheCreation": "cache_write",
+    "cache_creation": "cache_write",
+    "cache_write": "cache_write",
+}
+
+# Rates below are STANDARD COMMERCIAL on-demand rates (us-*, eu-*, ap-* etc.).
+# Cross-region inference (CRIS) is billed at the source region's on-demand rate
+# with no routing premium, so these hold for `us.`/`eu.`/`global.` CRIS profiles.
+# They do NOT hold for AWS GovCloud (higher) — for GovCloud or any region AWS
+# prices differently, override the whole table via BEDROCK_PRICING_RATES_JSON.
+#
 # Per-model-family rates in USD per 1M tokens (as of June 2026)
 # Source: https://aws.amazon.com/bedrock/pricing/
+# cache_read = 0.1x input, cache_write = 1.25x input (5-minute prompt-cache TTL).
+# NOTE: 1-hour-TTL cache writes are billed at 2.0x input, but the OTEL
+# `cacheCreation` metric does not carry the TTL, so we cannot distinguish them
+# and assume the default 5-minute rate.
 DEFAULT_RATES = {
     "fable": {
         "input": 10.00,
@@ -126,3 +152,40 @@ def calculate_cost(
         + (cache_write_tokens / 1_000_000) * family_rates.get("cache_write", 3.75)
     )
     return cost
+
+
+def resolve_rate_key(token_type: str) -> str | None:
+    """Map an OTEL metric `type` value to a rate-table key.
+
+    Returns None for token types that carry no price (unknown/metadata
+    dimensions). Critically, `cacheCreation` → `cache_write` so cache-write
+    tokens are not silently priced at $0.
+    """
+    return TOKEN_TYPE_TO_RATE_KEY.get(token_type)
+
+
+def cost_for_token_type(
+    token_type: str,
+    tokens: float,
+    model_family: str = DEFAULT_FAMILY,
+    rates: dict | None = None,
+) -> float:
+    """Cost in USD for `tokens` of a single OTEL token `type`.
+
+    Args:
+        token_type: OTEL `type` value ("input", "output", "cacheRead",
+            "cacheCreation", or their snake_case forms).
+        tokens: Number of tokens of that type.
+        model_family: "fable", "opus", "sonnet", or "haiku".
+        rates: Pricing rates dict (defaults to get_rates()).
+
+    Returns:
+        Estimated cost in USD (0.0 for unrecognized token types).
+    """
+    rate_key = resolve_rate_key(token_type)
+    if rate_key is None:
+        return 0.0
+    if rates is None:
+        rates = get_rates()
+    family_rates = rates.get(model_family, rates.get(DEFAULT_FAMILY, {}))
+    return (tokens / 1_000_000) * family_rates.get(rate_key, 0.0)

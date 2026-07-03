@@ -11,7 +11,14 @@ import pytest
 # Add shared to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "deployment" / "infrastructure" / "lambda-functions"))
 
-from shared.pricing import DEFAULT_RATES, calculate_cost, get_rates, resolve_model_family
+from shared.pricing import (
+    DEFAULT_RATES,
+    calculate_cost,
+    cost_for_token_type,
+    get_rates,
+    resolve_model_family,
+    resolve_rate_key,
+)
 
 
 class TestPricingUtility:
@@ -61,6 +68,70 @@ class TestPricingUtility:
     def test_zero_tokens_zero_cost(self):
         """No tokens = no cost."""
         assert calculate_cost(0, 0, 0, 0) == 0.0
+
+
+class TestCostForTokenType:
+    """Tests for cost_for_token_type — the OTEL metric `type` → cost bridge.
+
+    Regression: the quota_monitor cost calc used to look the metric `type` up
+    in the rate table directly. The table key is `cache_write` but Claude Code
+    emits `cacheCreation`, so every cache-write token was priced at $0, making
+    the reported spend systematically lower than the AWS bill.
+    """
+
+    def test_cache_creation_is_not_free(self):
+        """REGRESSION: `cacheCreation` tokens must be priced, not $0.
+
+        Claude Code emits `type=cacheCreation` for cache writes. Bedrock bills
+        these at 1.25x the input rate. A direct rate-table lookup returns $0.
+        """
+        cost = cost_for_token_type("cacheCreation", 1_000_000, "sonnet")
+        assert cost == pytest.approx(3.75)  # 1.25 x $3.00 sonnet input
+        assert cost > 0
+
+    def test_cache_creation_opus(self):
+        """`cacheCreation` at Opus rates = $6.25 per 1M (1.25 x $5 input)."""
+        assert cost_for_token_type("cacheCreation", 1_000_000, "opus") == pytest.approx(6.25)
+
+    def test_cache_read_camel_case(self):
+        """`cacheRead` (Claude Code's camelCase) maps to the cache_read rate."""
+        assert cost_for_token_type("cacheRead", 1_000_000, "sonnet") == pytest.approx(0.3)
+
+    def test_input_output(self):
+        """Plain input/output types price at their base rates."""
+        assert cost_for_token_type("input", 1_000_000, "sonnet") == pytest.approx(3.0)
+        assert cost_for_token_type("output", 1_000_000, "sonnet") == pytest.approx(15.0)
+
+    def test_snake_case_variants(self):
+        """snake_case type names are accepted too (non-Claude-Code paths)."""
+        assert cost_for_token_type("cache_creation", 1_000_000, "sonnet") == pytest.approx(3.75)
+        assert cost_for_token_type("cache_read", 1_000_000, "sonnet") == pytest.approx(0.3)
+
+    def test_unknown_type_is_free(self):
+        """Unrecognized/metadata token types carry no cost (not a crash)."""
+        assert cost_for_token_type("bogus", 1_000_000, "sonnet") == 0.0
+
+    def test_unknown_model_defaults_to_sonnet(self):
+        """Unknown model family falls back to Sonnet rates."""
+        assert cost_for_token_type("cacheCreation", 1_000_000, "mystery") == pytest.approx(3.75)
+
+
+class TestResolveRateKey:
+    """Tests for resolve_rate_key — metric `type` → rate-table key mapping."""
+
+    def test_cache_creation_maps_to_cache_write(self):
+        """The bug's root cause: cacheCreation must resolve to cache_write."""
+        assert resolve_rate_key("cacheCreation") == "cache_write"
+
+    def test_cache_read_maps_to_cache_read(self):
+        assert resolve_rate_key("cacheRead") == "cache_read"
+
+    def test_passthrough_types(self):
+        assert resolve_rate_key("input") == "input"
+        assert resolve_rate_key("output") == "output"
+
+    def test_unknown_returns_none(self):
+        assert resolve_rate_key("nonsense") is None
 
 
 class TestModelResolution:

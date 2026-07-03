@@ -104,14 +104,16 @@ def fetch_usage_from_promql():
                 u["input_tokens"] = val
             elif token_type == "output":
                 u["output_tokens"] = val
-            elif token_type in ("cache_read", "cacheRead"):
-                u["cache_tokens"] = val
+            elif token_type in ("cache_read", "cacheRead", "cache_creation", "cacheCreation"):
+                # Both cache reads AND cache writes (creation) are cache tokens.
+                # Accumulate — a user can have a row for each in the same window.
+                u["cache_tokens"] = u.get("cache_tokens", 0) + val
 
     # Calculate per-user cost from model-aware token breakdown
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-        from shared.pricing import calculate_cost, resolve_model_family, get_rates
+        from shared.pricing import cost_for_token_type, resolve_model_family, get_rates
 
         rates = get_rates()
         for r in type_model_results:
@@ -122,9 +124,10 @@ def fetch_usage_from_promql():
             if email and val > 0 and token_type and model:
                 u = users.setdefault(email, {})
                 family = resolve_model_family(model)
-                family_rates = rates.get(family, rates.get("sonnet", {}))
-                rate = family_rates.get(token_type.replace("cacheRead", "cache_read"), 0)
-                cost_delta = (val / 1_000_000) * rate
+                # cost_for_token_type maps `cacheCreation` → cache_write rate.
+                # Do NOT look token_type up in the rate table directly — the
+                # table has no `cacheCreation` key, so writes would cost $0.
+                cost_delta = cost_for_token_type(token_type, val, family, rates)
                 u["cost_usd"] = u.get("cost_usd", 0) + cost_delta
     except Exception as e:
         # Cost calculation is optional — don't fail the whole run
@@ -155,14 +158,10 @@ def fetch_usage_from_promql():
                 if model:
                     try:
                         family = resolve_model_family(model)
-                        family_rates = rates.get(family, rates.get("sonnet", {}))
-                        # Determine token type from metric name
+                        # Determine token type from metric name (input vs output)
                         metric_name = r["metric"].get("__name__", "")
-                        if "input" in metric_name:
-                            rate = family_rates.get("input", 3.0)
-                        else:
-                            rate = family_rates.get("output", 15.0)
-                        u["cost_usd"] = u.get("cost_usd", 0) + (val / 1_000_000) * rate
+                        token_type = "input" if "input" in metric_name else "output"
+                        u["cost_usd"] = u.get("cost_usd", 0) + cost_for_token_type(token_type, val, family, rates)
                     except Exception:
                         pass
                 cowork_count += 1
